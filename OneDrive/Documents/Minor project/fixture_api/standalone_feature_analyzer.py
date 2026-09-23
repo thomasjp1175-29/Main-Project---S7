@@ -15,7 +15,7 @@ at the bottom for the entry point a FastAPI endpoint would call.
 import os
 from itertools import combinations
 import cadquery as cq
-from cadquery.occ_impl.shapes import Shape
+from cadquery.occ_impl.shapes import Shape, Compound
 
 
 # ---------------------------------------------------------------------
@@ -36,6 +36,8 @@ DEFAULT_MATERIAL = "Aluminum 6061-T6"
 DEFAULT_SAFETY_FACTOR = 2.0     # allowable stress = yield / safety_factor
 DEFAULT_APPLIED_FORCE_N = 500.0  # total clamping + machining reaction load
 DEFAULT_PIN_CONTACT_RADIUS_MM = 5.0  # fixture pin/support tip contact radius
+DEFAULT_PIN_HEIGHT_MM = 15.0  # how tall the visualized/exported clamp pins are
+DEFAULT_NUM_SUPPORT_POINTS = 4  # supports to place (falls back to 3 if 4 isn't physically valid)
 
 
 # ---------------------------------------------------------------------
@@ -111,6 +113,54 @@ def solve_reactions(p1, p2, p3, cog_x, cog_y):
     return R
 
 
+def _det3(a):
+    return (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+
+
+def solve_reactions_n(points, cog_x, cog_y):
+    """
+    Reaction-fraction solution for N >= 3 support points satisfying
+    force/moment equilibrium about the part's CoG: sum(R)=1,
+    sum(R*x)=cog_x, sum(R*y)=cog_y.
+
+    For N == 3 this is exactly determined (same result as
+    solve_reactions). For N > 3 (e.g. 4 corner supports on a flat
+    plate) the system is statically indeterminate, so this returns the
+    minimum-norm least-squares solution R = A^T (A A^T)^-1 b - the
+    standard assumption for equal-stiffness rigid supports, which
+    spreads load across all points rather than picking an arbitrary
+    determinate subset.
+    """
+    n = len(points)
+    sum_x = sum(p[0] for p in points)
+    sum_y = sum(p[1] for p in points)
+    sum_xx = sum(p[0] ** 2 for p in points)
+    sum_xy = sum(p[0] * p[1] for p in points)
+    sum_yy = sum(p[1] ** 2 for p in points)
+
+    M = [
+        [n, sum_x, sum_y],
+        [sum_x, sum_xx, sum_xy],
+        [sum_y, sum_xy, sum_yy],
+    ]
+    b = [1, cog_x, cog_y]
+
+    detM = _det3(M)
+    if abs(detM) < 1e-9:
+        return None
+    v = []
+    for i in range(3):
+        Mi = [row[:] for row in M]
+        for r in range(3):
+            Mi[r][i] = b[r]
+        v.append(_det3(Mi) / detM)
+
+    v0, v1, v2 = v
+    return [v0 + v1 * p[0] + v2 * p[1] for p in points]
+
+
 def candidate_primary_points(bbox, hole_centers, hole_radius, margin):
     corners = [
         (bbox.xmax - margin, bbox.ymax - margin),
@@ -159,13 +209,47 @@ def contact_stress_mpa(reaction_fraction, applied_force_n, pin_radius_mm):
 
 
 def centroid_offset_from_cog(combo, cog_x, cog_y):
-    """Distance from the support triangle's centroid to the part's CoG
+    """Distance from the support combo's centroid to the part's CoG
     (projected onto XY, i.e. the plane the part rests on). Smaller is
-    better: it means the support triangle brackets the CoG rather than
-    sitting off to one side."""
-    cx = sum(p[0] for p in combo) / 3.0
-    cy = sum(p[1] for p in combo) / 3.0
+    better: it means the supports bracket the CoG rather than sitting
+    off to one side."""
+    n = len(combo)
+    cx = sum(p[0] for p in combo) / n
+    cy = sum(p[1] for p in combo) / n
     return ((cx - cog_x) ** 2 + (cy - cog_y) ** 2) ** 0.5
+
+
+def _evaluate_combo(combo, cog_x, cog_y, allowable_mpa, applied_force_n, pin_radius_mm, bbox_diag):
+    if len(combo) == 3:
+        R = solve_reactions(combo[0], combo[1], combo[2], cog_x, cog_y)
+    else:
+        R = solve_reactions_n(combo, cog_x, cog_y)
+
+    if R is None or any(r < -1e-6 for r in R):
+        return None
+
+    spread = max(R) - min(R)
+    cog_offset = centroid_offset_from_cog(combo, cog_x, cog_y)
+    stresses = [contact_stress_mpa(r, applied_force_n, pin_radius_mm) for r in R]
+    max_stress = max(stresses)
+    overstressed = max_stress > allowable_mpa
+    stress_overshoot = max(0.0, max_stress - allowable_mpa)
+
+    score = (
+        spread
+        + (cog_offset / bbox_diag)
+        + 5.0 * (stress_overshoot / allowable_mpa if allowable_mpa else stress_overshoot)
+    )
+
+    return {
+        "combo": combo,
+        "reactions": R,
+        "cog_offset_mm": cog_offset,
+        "stresses_mpa": stresses,
+        "max_stress_mpa": max_stress,
+        "overstressed": overstressed,
+        "score": score,
+    }
 
 
 def choose_primary_points_weighted(
@@ -177,16 +261,16 @@ def choose_primary_points_weighted(
     safety_factor=DEFAULT_SAFETY_FACTOR,
     applied_force_n=DEFAULT_APPLIED_FORCE_N,
     pin_radius_mm=DEFAULT_PIN_CONTACT_RADIUS_MM,
+    num_support_points=DEFAULT_NUM_SUPPORT_POINTS,
 ):
     """
-    Picks the 3-2-1 primary support triangle by combining three factors
-    instead of geometric spread alone:
+    Picks the primary support points by combining three factors instead
+    of geometric spread alone:
 
       1. Load balance   - reactions should be as even as possible
-                           (same "spread" metric as the original solver)
-      2. CoG centering  - the support triangle's centroid should sit
-                           close to the part's center of gravity, so the
-                           part doesn't tip/rock on its supports
+      2. CoG centering  - the supports' centroid should sit close to
+                           the part's center of gravity, so the part
+                           doesn't tip/rock on its supports
       3. Contact stress - the peak contact stress at any one support
                            point (reaction force / pin contact area)
                            must stay under the material's allowable
@@ -194,8 +278,16 @@ def choose_primary_points_weighted(
                            that violate this are only used as a last
                            resort, and are flagged in the result.
 
-    Returns (combo, reactions, diagnostics) or None if no 3-point
-    equilibrium solution exists at all.
+    Tries `num_support_points` supports first (default 4 - e.g. all
+    four corners of a rectangular plate; statically indeterminate, so
+    reactions come from the minimum-norm least-squares solution). If
+    that yields no physically valid (non-negative reaction) candidate
+    - e.g. the CoG sits somewhere a 4-point equal-stiffness split can't
+    support without a negative/pulling reaction - falls back to the
+    classic 3-point statically-determinate solution, which always has
+    a solution as long as 3 non-collinear candidates exist.
+
+    Returns (combo, reactions, diagnostics) or None if nothing works.
     """
     if yield_strength_mpa is None:
         yield_strength_mpa = MATERIAL_YIELD_MPA.get(material, MATERIAL_YIELD_MPA[DEFAULT_MATERIAL])
@@ -208,35 +300,24 @@ def choose_primary_points_weighted(
         1.0,
     )
 
-    candidates = []
-    for combo in combinations(corners, 3):
-        R = solve_reactions(combo[0], combo[1], combo[2], cog_x, cog_y)
-        if R is None or any(r < 0 for r in R):
-            continue
+    def candidates_for(k):
+        if k > len(corners):
+            return []
+        combos = [tuple(corners)] if len(corners) == k else list(combinations(corners, k))
+        out = []
+        for combo in combos:
+            ev = _evaluate_combo(combo, cog_x, cog_y, allowable_mpa, applied_force_n, pin_radius_mm, bbox_diag)
+            if ev is not None:
+                out.append(ev)
+        return out
 
-        spread = max(R) - min(R)
-        cog_offset = centroid_offset_from_cog(combo, cog_x, cog_y)
-        stresses = [contact_stress_mpa(r, applied_force_n, pin_radius_mm) for r in R]
-        max_stress = max(stresses)
-        overstressed = max_stress > allowable_mpa
-        stress_overshoot = max(0.0, max_stress - allowable_mpa)
-
-        score = (
-            spread
-            + (cog_offset / bbox_diag)
-            + 5.0 * (stress_overshoot / allowable_mpa if allowable_mpa else stress_overshoot)
-        )
-
-        candidates.append({
-            "combo": combo,
-            "reactions": R,
-            "cog_offset_mm": cog_offset,
-            "stresses_mpa": stresses,
-            "max_stress_mpa": max_stress,
-            "allowable_mpa": allowable_mpa,
-            "overstressed": overstressed,
-            "score": score,
-        })
+    used_fallback_3point = False
+    candidates = candidates_for(num_support_points)
+    if not candidates and num_support_points != 3 and len(corners) >= 3:
+        # 4-point (or N-point) equilibrium had no physically valid
+        # solution - fall back to the classic determinate 3-point case.
+        candidates = candidates_for(3)
+        used_fallback_3point = bool(candidates)
 
     if not candidates:
         return None
@@ -259,9 +340,46 @@ def choose_primary_points_weighted(
         "per_point_stress_mpa": best["stresses_mpa"],
         "overstressed": best["overstressed"],
         "used_fallback_overstressed_candidate": best["overstressed"] and bool(candidates) and not safe,
+        "num_support_points": len(best["combo"]),
+        "used_fallback_3point": used_fallback_3point,
     }
 
     return best["combo"], best["reactions"], diagnostics
+
+
+# ---------------------------------------------------------------------
+# CLAMP / SUPPORT PIN GEOMETRY
+#
+# Each 3-2-1 support point becomes a physical cylindrical pin standing
+# under the part, touching it at (x, y, z_top) and extending downward
+# by pin_height_mm. These are what get drawn into the .glb viewer and
+# baked into the exported .stp.
+# ---------------------------------------------------------------------
+def build_clamp_pin_shape(x, y, z_top, radius_mm, height_mm):
+    """Returns a CadQuery/OCC Shape: a cylinder whose top face sits at
+    (x, y, z_top) and extends downward by height_mm - i.e. a fixture
+    pin supporting the part from below at that support point."""
+    pin = (
+        cq.Workplane("XY")
+        .circle(radius_mm)
+        .extrude(-height_mm)
+        .translate((x, y, z_top))
+    )
+    return pin.val()
+
+
+def build_clamp_pin_trimesh(x, y, z_top, radius_mm, height_mm, sections=32):
+    """Same pin, as a trimesh mesh in CAD mm coordinates (not yet
+    converted to glTF space) - used for the web-viewer .glb."""
+    import trimesh
+
+    mesh = trimesh.creation.cylinder(radius=radius_mm, height=height_mm, sections=sections)
+    # trimesh's cylinder is centered on its own origin (spans
+    # [-height/2, +height/2]); shift so the TOP face sits at z=0, then
+    # move to the actual support point.
+    mesh.apply_translation((0, 0, -height_mm / 2.0))
+    mesh.apply_translation((x, y, z_top))
+    return mesh
 
 
 # ---------------------------------------------------------------------
@@ -270,11 +388,14 @@ def choose_primary_points_weighted(
 def analyze_step(
     stp_path: str,
     glb_out_path: str = None,
+    stp_out_path: str = None,
     material: str = DEFAULT_MATERIAL,
     yield_strength_mpa: float = None,
     safety_factor: float = DEFAULT_SAFETY_FACTOR,
     applied_force_n: float = DEFAULT_APPLIED_FORCE_N,
     pin_radius_mm: float = DEFAULT_PIN_CONTACT_RADIUS_MM,
+    pin_height_mm: float = DEFAULT_PIN_HEIGHT_MM,
+    num_support_points: int = DEFAULT_NUM_SUPPORT_POINTS,
 ):
     result = cq.importers.importStep(stp_path)
     shape = result.val()
@@ -323,6 +444,7 @@ def analyze_step(
         safety_factor=safety_factor,
         applied_force_n=applied_force_n,
         pin_radius_mm=pin_radius_mm,
+        num_support_points=num_support_points,
     )
 
     support_points = []
@@ -330,7 +452,13 @@ def analyze_step(
     if support_result:
         pts, reactions, diag = support_result
         clamp_analysis = diag
-        report_lines.append("3-2-1 PRIMARY SUPPORT POINTS (stress + CoG aware)")
+        report_lines.append(f"{diag['num_support_points']}-POINT PRIMARY SUPPORT LAYOUT (stress + CoG aware)")
+        if diag["used_fallback_3point"]:
+            report_lines.append(
+                f"  NOTE: requested {num_support_points} support points, but no physically valid"
+                f" (non-negative reaction) {num_support_points}-point solution existed for this"
+                f" CoG - fell back to the classic 3-point determinate solution."
+            )
         report_lines.append(
             f"  Material: {diag['material']}  |  Yield: {diag['yield_strength_mpa']:.1f} MPa"
             f"  |  Safety factor: {diag['safety_factor']:.1f}x"
@@ -371,9 +499,21 @@ def analyze_step(
 
     report_text = "\n".join(report_lines)
 
-    # --- export a mesh for the web viewer ---
+    # --- clamp/support pin geometry (CAD space, mm) --------------------
+    # Pins stand under the part's primary locating plane (bottom face,
+    # z = bbox.zmin), touching it at each support point's (x, y).
+    z_top = bbox.zmin
+    pin_shapes = [
+        build_clamp_pin_shape(pt["x"], pt["y"], z_top, pin_radius_mm, pin_height_mm)
+        for pt in support_points
+    ]
+
+    # --- export a mesh for the web viewer, WITH the clamp pins drawn on it ---
     # CadQuery doesn't export GLB directly, so we go STEP -> STL -> GLB
     # (via trimesh), and rotate Z-up (CAD) into Y-up (glTF) on the way.
+    # Pins are built directly as trimesh cylinders (cheaper than round-
+    # tripping each one through STEP/STL) and merged into one Scene so
+    # they show up as red pins on the part in the viewer.
     # pip install trimesh
     if glb_out_path:
         import trimesh
@@ -383,16 +523,47 @@ def analyze_step(
             stl_path = tmp_stl.name
         cq.exporters.export(shape, stl_path, exportType="STL")
 
-        mesh = trimesh.load(stl_path)
-        rotation = trimesh.transformations.rotation_matrix(
-            angle=-1.5707963267948966,  # -90 degrees, in radians
-            direction=[1, 0, 0],
-        )
-        mesh.apply_scale(0.001)      # mm -> m
-        mesh.apply_transform(rotation)  # Z-up -> Y-up
-        mesh.export(glb_out_path)
+        def to_gltf_space(mesh):
+            rotation = trimesh.transformations.rotation_matrix(
+                angle=-1.5707963267948966,  # -90 degrees, in radians
+                direction=[1, 0, 0],
+            )
+            mesh.apply_scale(0.001)      # mm -> m
+            mesh.apply_transform(rotation)  # Z-up -> Y-up
+            return mesh
 
+        part_mesh = to_gltf_space(trimesh.load(stl_path))
+        part_mesh.visual.face_colors = [180, 180, 190, 255]  # neutral gray
+
+        scene = trimesh.Scene()
+        scene.add_geometry(part_mesh, geom_name="part")
+
+        for i, pt in enumerate(support_points):
+            pin_mesh = build_clamp_pin_trimesh(pt["x"], pt["y"], z_top, pin_radius_mm, pin_height_mm)
+            pin_mesh = to_gltf_space(pin_mesh)
+            over = pt.get("contact_stress_mpa", 0) > (clamp_analysis["allowable_stress_mpa"] if clamp_analysis else float("inf"))
+            pin_mesh.visual.face_colors = [220, 40, 40, 255] if over else [220, 30, 30, 255]
+            scene.add_geometry(pin_mesh, geom_name=f"clamp_{i + 1}")
+
+        scene.export(glb_out_path)
         os.unlink(stl_path)
+
+    # --- export the part + clamp pins as one downloadable .stp ---------
+    # Uses a colored Assembly (gray part, red pins) so the STEP file
+    # itself shows the clamp positions highlighted when opened in
+    # Fusion 360 or another CAD tool that reads STEP color/style data.
+    # Falls back to an uncolored compound if colored Assembly export
+    # isn't supported by the installed CadQuery/OCC version.
+    if stp_out_path:
+        try:
+            assy = cq.Assembly()
+            assy.add(shape, name="part", color=cq.Color(0.75, 0.75, 0.78, 1.0))
+            for i, pin_shape in enumerate(pin_shapes):
+                assy.add(pin_shape, name=f"clamp_{i + 1}", color=cq.Color(0.9, 0.1, 0.1, 1.0))
+            assy.save(stp_out_path, exportType="STEP")
+        except Exception:
+            assembly_shape = Compound.makeCompound([shape] + pin_shapes)
+            cq.exporters.export(assembly_shape, stp_out_path, exportType="STEP")
 
     # Support points + COG converted into the same space as the exported
     # mesh, so the frontend can place hotspots directly on the model.
@@ -412,13 +583,24 @@ def analyze_step(
         "center_of_mass": {"x": cog.x, "y": cog.y, "z": cog.z},
         "center_of_mass_gltf": cog_gltf,
         "clamp_analysis": clamp_analysis,  # material/force/stress diagnostics, or None
+        "pin_height_mm": pin_height_mm,
+        "glb_path": glb_out_path,   # part + clamp pins, for the web viewer
+        "stp_path": stp_out_path,   # part + clamp pins, downloadable CAD file
     }
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python standalone_feature_analyzer.py path/to/part.stp")
+        print("Usage: python standalone_feature_analyzer.py path/to/part.stp [out_dir]")
         sys.exit(1)
-    result = analyze_step(sys.argv[1])
+
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(sys.argv[1])) or "."
+    glb_out = os.path.join(out_dir, "fixture_layout.glb")
+    stp_out = os.path.join(out_dir, "fixture_layout.stp")
+
+    result = analyze_step(sys.argv[1], glb_out_path=glb_out, stp_out_path=stp_out)
     print(result["report_text"])
+    print()
+    print(f"Viewer mesh (part + clamp pins) : {glb_out}")
+    print(f"Downloadable CAD file (part + clamp pins) : {stp_out}")
