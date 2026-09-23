@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Fixture Design Viewer</title>
+<script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #1a1a1a; color: #eee; }
+  header { padding: 16px 24px; background: #111; border-bottom: 1px solid #333; }
+  header h1 { margin: 0; font-size: 18px; }
+  main { display: flex; height: calc(100vh - 57px); }
+  .viewer-pane { flex: 2; position: relative; }
+  .side-pane { flex: 1; padding: 20px; overflow-y: auto; background: #151515; border-left: 1px solid #333; }
+  model-viewer { width: 100%; height: 100%; background: #222; }
+  .upload-box { padding: 20px; text-align: center; }
+  input[type=file] { color: #eee; }
+  button { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-top: 8px; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  pre { white-space: pre-wrap; font-size: 12px; background: #0d0d0d; padding: 12px; border-radius: 4px; max-height: 40vh; overflow-y: auto; }
+  .stat { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #2a2a2a; }
+  .hotspot { background: #ef4444; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 6px rgba(0,0,0,0.6); }
+  .status { font-size: 13px; color: #999; margin-top: 8px; }
+  .error { color: #f87171; }
+</style>
+</head>
+<body>
+
+<header><h1>Fixture Design Viewer — 3-2-1 Support Point Generator</h1></header>
+
+<main>
+  <div class="viewer-pane">
+    <div class="upload-box">
+      <input type="file" id="fileInput" accept=".stp,.step">
+      <button id="analyzeBtn">Analyze</button>
+      <div class="status" id="status"></div>
+    </div>
+    <model-viewer id="viewer" camera-controls auto-rotate style="display:none;"></model-viewer>
+  </div>
+
+  <div class="side-pane">
+    <h3>Feature Summary</h3>
+    <div id="summary">Upload a .stp file to begin.</div>
+
+    <h3 style="margin-top: 24px;">Full Report</h3>
+    <pre id="reportText">—</pre>
+  </div>
+</main>
+
+<script>
+  // Change this if your API runs somewhere other than localhost:8000
+  const API_BASE = "http://127.0.0.1:8000";
+
+  const fileInput = document.getElementById("fileInput");
+  const analyzeBtn = document.getElementById("analyzeBtn");
+  const statusEl = document.getElementById("status");
+  const viewer = document.getElementById("viewer");
+  const summaryEl = document.getElementById("summary");
+  const reportEl = document.getElementById("reportText");
+
+  analyzeBtn.addEventListener("click", async () => {
+    const file = fileInput.files[0];
+    if (!file) {
+      statusEl.textContent = "Choose a .stp file first.";
+      statusEl.className = "status error";
+      return;
+    }
+
+    analyzeBtn.disabled = true;
+    statusEl.className = "status";
+    statusEl.textContent = "Analyzing... this can take a moment for larger parts.";
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await fetch(`${API_BASE}/analyze`, { method: "POST", body: formData });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.detail || `Server returned ${res.status}`);
+      }
+      const data = await res.json();
+      renderResult(data);
+      statusEl.textContent = "Done.";
+    } catch (err) {
+      statusEl.className = "status error";
+      statusEl.textContent = "Error: " + err.message;
+      console.error(err);
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  });
+
+  function renderResult(data) {
+    // Load the model
+    viewer.src = API_BASE + data.glb_url;
+    viewer.style.display = "block";
+
+    // Clear old hotspots, then add one per support point
+    [...viewer.querySelectorAll("[slot^='hotspot-']")].forEach(el => el.remove());
+    data.support_points_gltf.forEach((pt, i) => {
+      const hotspot = document.createElement("div");
+      hotspot.className = "hotspot";
+      hotspot.slot = `hotspot-${i}`;
+      hotspot.dataset.position = `${pt.x} ${pt.y} ${pt.z}`;
+      hotspot.title = `Support point ${i + 1} — ${pt.reaction_pct.toFixed(1)}% reaction share`;
+      viewer.appendChild(hotspot);
+    });
+
+    // Summary panel
+    summaryEl.innerHTML = `
+      <div class="stat"><span>Through Holes</span><span>${data.through_holes}</span></div>
+      <div class="stat"><span>Corner Fillets</span><span>${data.corner_fillets}</span></div>
+      <div class="stat"><span>Unknown Cylinders</span><span>${data.unknown_cylinders}</span></div>
+      <div class="stat"><span>Center of Mass (mm)</span><span>${data.center_of_mass.x.toFixed(2)}, ${data.center_of_mass.y.toFixed(2)}, ${data.center_of_mass.z.toFixed(2)}</span></div>
+      <h4 style="margin-top:16px;">3-2-1 Primary Support Points</h4>
+      ${data.support_points.map((p, i) =>
+        `<div class="stat"><span>Point ${i + 1} (${p.x.toFixed(1)}, ${p.y.toFixed(1)}) mm</span><span>${p.reaction_pct.toFixed(1)}%</span></div>`
+      ).join("")}
+    `;
+
+    reportEl.textContent = data.report_text;
+  }
+</script>
+
+</body>
+</html>
