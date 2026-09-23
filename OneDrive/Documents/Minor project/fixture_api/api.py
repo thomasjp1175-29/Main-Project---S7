@@ -33,6 +33,7 @@ from standalone_feature_analyzer import (
     DEFAULT_SAFETY_FACTOR,
     DEFAULT_APPLIED_FORCE_N,
     DEFAULT_PIN_CONTACT_RADIUS_MM,
+    DEFAULT_NUM_SUPPORT_POINTS,
 )
 
 app = FastAPI(title="Fixture Design API")
@@ -46,11 +47,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Where generated .glb files get saved and served from, e.g.
-# http://127.0.0.1:8000/models/<some-id>.glb
+# Where generated .glb (viewer mesh) and .stp (downloadable CAD, part +
+# clamp pins) files get saved and served from, e.g.
+# http://127.0.0.1:8000/models/<id>.glb and /exports/<id>.stp
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "generated_models")
+EXPORTS_DIR = os.path.join(os.path.dirname(__file__), "generated_exports")
 os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 app.mount("/models", StaticFiles(directory=MODELS_DIR), name="models")
+app.mount("/exports", StaticFiles(directory=EXPORTS_DIR), name="exports")
 
 
 @app.get("/")
@@ -72,6 +77,7 @@ async def analyze(
     applied_force_n: float = Form(DEFAULT_APPLIED_FORCE_N),
     pin_radius_mm: float = Form(DEFAULT_PIN_CONTACT_RADIUS_MM),
     safety_factor: float = Form(DEFAULT_SAFETY_FACTOR),
+    num_support_points: int = Form(DEFAULT_NUM_SUPPORT_POINTS),
 ):
     if not file.filename.lower().endswith((".stp", ".step")):
         raise HTTPException(status_code=400, detail="Please upload a .stp or .step file")
@@ -82,17 +88,22 @@ async def analyze(
         tmp.write(contents)
         tmp_path = tmp.name
 
-    glb_filename = f"{uuid.uuid4().hex}.glb"
+    job_id = uuid.uuid4().hex
+    glb_filename = f"{job_id}.glb"
+    stp_filename = f"{job_id}_fixture_layout.stp"
     glb_path = os.path.join(MODELS_DIR, glb_filename)
+    stp_path = os.path.join(EXPORTS_DIR, stp_filename)
 
     try:
         result = analyze_step(
             tmp_path,
             glb_out_path=glb_path,
+            stp_out_path=stp_path,
             material=material,
             applied_force_n=applied_force_n,
             pin_radius_mm=pin_radius_mm,
             safety_factor=safety_factor,
+            num_support_points=num_support_points,
         )
         return {
             "filename": file.filename,
@@ -105,7 +116,8 @@ async def analyze(
             "support_points_gltf": result["support_points_gltf"],
             "clamp_analysis": result["clamp_analysis"],
             "report_text": result["report_text"],
-            "glb_url": f"/models/{glb_filename}",
+            "glb_url": f"/models/{glb_filename}",       # part + clamp pins, for the 3D viewer
+            "stp_url": f"/exports/{stp_filename}",       # part + clamp pins, downloadable
         }
     except Exception:
         raise HTTPException(status_code=500, detail=traceback.format_exc())
